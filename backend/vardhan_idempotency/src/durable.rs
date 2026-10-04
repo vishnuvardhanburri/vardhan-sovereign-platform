@@ -1,10 +1,8 @@
 //! Durable idempotency registry for API/transaction ingress.
 //!
-//! This layer makes the idempotency decision survive process restart and
-//! serializes writers with an OS lock. Deployments with multiple nodes should
-//! place the state file on a shared strongly-consistent filesystem or replace
-//! this store with a transactional database adapter implementing the same
-//! atomic check/register semantics.
+//! This layer survives process restart and serializes writers with an OS lock.
+//! For multi-node deployments, use a shared strongly-consistent filesystem or
+//! replace this adapter with a transactional database implementation.
 
 use crate::{DuplicateDetected, IdempotencyKey, IdempotencyRecord, IdempotencyStatus};
 use serde::{Deserialize, Serialize};
@@ -23,17 +21,18 @@ pub enum DurableIdempotencyError {
     LockTimeout,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableRecord {
+    key: String,
+    record: IdempotencyRecord,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DurableState {
-    records: Vec<IdempotencyRecord>,
+    records: Vec<DurableRecord>,
 }
 
 /// Restart-safe idempotency store with atomic check/register semantics.
-///
-/// The lock file prevents two local processes from accepting the same
-/// `(tenant_id, idempotency_key)` concurrently. The persisted record is written
-/// through a temporary file followed by rename so a crash cannot leave a
-/// partially-written JSON document.
 pub struct DurableIdempotencyRegistry {
     path: PathBuf,
     lock_path: PathBuf,
@@ -47,18 +46,14 @@ impl DurableIdempotencyRegistry {
     }
 
     fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
     }
 
     fn load(&self) -> Result<DurableState, DurableIdempotencyError> {
         if !self.path.exists() {
             return Ok(DurableState::default());
         }
-        let bytes = fs::read(&self.path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        Ok(serde_json::from_slice(&fs::read(&self.path)?)?)
     }
 
     fn save(&self, state: &DurableState) -> Result<(), DurableIdempotencyError> {
@@ -107,29 +102,29 @@ impl DurableIdempotencyRegistry {
         self.with_lock(|| {
             let now = Self::now_ms();
             let mut state = self.load()?;
-            state.records.retain(|record| record.expires_at_ms > now);
+            state.records.retain(|entry| entry.record.expires_at_ms > now);
 
-            if let Some(record) = state.records.iter().find(|record| {
-                record.tenant_id == tenant_id && record.transaction_id != transaction_id && record.expires_at_ms > now
+            if let Some(entry) = state.records.iter().find(|entry| {
+                entry.record.tenant_id == tenant_id && entry.key == key.as_str()
             }) {
-                // The record lookup above must also match the caller's key. The key is
-                // represented by the transaction ingress layer, so transaction IDs are
-                // kept unique per idempotency decision in this durable store.
-                if record.status != IdempotencyStatus::Failed {
+                if entry.record.status != IdempotencyStatus::Failed {
                     return Ok(Err(DuplicateDetected {
-                        original_transaction_id: record.transaction_id.clone(),
-                        registered_at_ms: record.registered_at_ms,
+                        original_transaction_id: entry.record.transaction_id.clone(),
+                        registered_at_ms: entry.record.registered_at_ms,
                     }));
                 }
             }
 
             let expires_at_ms = now.saturating_add(window_ms);
-            state.records.push(IdempotencyRecord {
-                transaction_id: format!("{}::{}", tenant_id, key.as_str()),
-                tenant_id: tenant_id.to_string(),
-                registered_at_ms: now,
-                expires_at_ms,
-                status: IdempotencyStatus::Pending,
+            state.records.push(DurableRecord {
+                key: key.as_str().to_string(),
+                record: IdempotencyRecord {
+                    transaction_id: transaction_id.to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    registered_at_ms: now,
+                    expires_at_ms,
+                    status: IdempotencyStatus::Pending,
+                },
             });
             self.save(&state)?;
             Ok(Ok(()))
@@ -139,15 +134,22 @@ impl DurableIdempotencyRegistry {
     pub fn complete(&self, tenant_id: &str, key: &IdempotencyKey) -> Result<(), DurableIdempotencyError> {
         self.with_lock(|| {
             let mut state = self.load()?;
-            let target = format!("{}::{}", tenant_id, key.as_str());
-            if let Some(record) = state.records.iter_mut().find(|record| record.transaction_id == target && record.tenant_id == tenant_id) {
-                record.status = IdempotencyStatus::Completed;
+            if let Some(entry) = state.records.iter_mut().find(|entry| entry.record.tenant_id == tenant_id && entry.key == key.as_str()) {
+                entry.record.status = IdempotencyStatus::Completed;
             }
             self.save(&state)
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn fail(&self, tenant_id: &str, key: &IdempotencyKey) -> Result<(), DurableIdempotencyError> {
+        self.with_lock(|| {
+            let mut state = self.load()?;
+            if let Some(entry) = state.records.iter_mut().find(|entry| entry.record.tenant_id == tenant_id && entry.key == key.as_str()) {
+                entry.record.status = IdempotencyStatus::Failed;
+            }
+            self.save(&state)
+        })
     }
+
+    pub fn path(&self) -> &Path { &self.path }
 }
