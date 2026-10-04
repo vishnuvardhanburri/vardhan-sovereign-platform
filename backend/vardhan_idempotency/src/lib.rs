@@ -1,3 +1,5 @@
+pub mod durable;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,7 +67,6 @@ impl IdempotencyRegistry {
         self.purge_expired();
 
         let map_key = (tenant_id.to_string(), key.as_str().to_string());
-
         let now = Self::now_ms();
         if let Some(record) = self.store.get(&map_key) {
             if record.expires_at_ms > now {
@@ -87,7 +88,6 @@ impl IdempotencyRegistry {
                 status: IdempotencyStatus::Pending,
             },
         );
-
         Ok(())
     }
 
@@ -111,6 +111,12 @@ impl IdempotencyRegistry {
     }
 }
 
+impl Default for IdempotencyRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,26 +127,21 @@ mod tests {
     fn test_new_key_registers_successfully() {
         let mut reg = IdempotencyRegistry::new();
         let key = IdempotencyKey::new("key1");
-        let res = reg.check_and_register("tenant1", &key, "tx1", 1000);
-        assert!(res.is_ok());
+        assert!(reg.check_and_register("tenant1", &key, "tx1", 1000).is_ok());
     }
 
     #[test]
     fn test_duplicate_key_same_tenant_rejected() {
         let mut reg = IdempotencyRegistry::new();
         let key = IdempotencyKey::new("key1");
-        reg.check_and_register("tenant1", &key, "tx1", 1000)
-            .unwrap();
-
-        let res = reg.check_and_register("tenant1", &key, "tx2", 1000);
-        assert!(res.is_err());
+        reg.check_and_register("tenant1", &key, "tx1", 1000).unwrap();
+        assert!(reg.check_and_register("tenant1", &key, "tx2", 1000).is_err());
     }
 
     #[test]
     fn test_same_key_different_tenant_allowed() {
         let mut reg = IdempotencyRegistry::new();
         let key = IdempotencyKey::new("key1");
-
         assert!(reg.check_and_register("tenant1", &key, "tx1", 1000).is_ok());
         assert!(reg.check_and_register("tenant2", &key, "tx2", 1000).is_ok());
     }
@@ -149,25 +150,17 @@ mod tests {
     fn test_expired_key_allows_reregistration() {
         let mut reg = IdempotencyRegistry::new();
         let key = IdempotencyKey::new("key1");
-
-        // register with window 0, which means it expires immediately
         reg.check_and_register("tenant1", &key, "tx1", 0).unwrap();
         sleep(Duration::from_millis(1));
-
-        let res = reg.check_and_register("tenant1", &key, "tx2", 1000);
-        assert!(res.is_ok());
+        assert!(reg.check_and_register("tenant1", &key, "tx2", 1000).is_ok());
     }
 
     #[test]
     fn test_duplicate_returns_original_transaction_id() {
         let mut reg = IdempotencyRegistry::new();
         let key = IdempotencyKey::new("key1");
-        reg.check_and_register("tenant1", &key, "tx1", 1000)
-            .unwrap();
-
-        let err = reg
-            .check_and_register("tenant1", &key, "tx2", 1000)
-            .unwrap_err();
+        reg.check_and_register("tenant1", &key, "tx1", 1000).unwrap();
+        let err = reg.check_and_register("tenant1", &key, "tx2", 1000).unwrap_err();
         assert_eq!(err.original_transaction_id, "tx1");
     }
 
@@ -175,14 +168,10 @@ mod tests {
     fn test_complete_marks_record() {
         let mut reg = IdempotencyRegistry::new();
         let key = IdempotencyKey::new("key1");
-        reg.check_and_register("tenant1", &key, "tx1", 1000)
-            .unwrap();
-
+        reg.check_and_register("tenant1", &key, "tx1", 1000).unwrap();
         reg.complete("tenant1", &key);
-
         let map_key = ("tenant1".to_string(), "key1".to_string());
-        let record = reg.store.get(&map_key).unwrap();
-        assert_eq!(record.status, IdempotencyStatus::Completed);
+        assert_eq!(reg.store.get(&map_key).unwrap().status, IdempotencyStatus::Completed);
     }
 
     #[test]
@@ -190,16 +179,11 @@ mod tests {
         let mut reg = IdempotencyRegistry::new();
         let key1 = IdempotencyKey::new("key1");
         let key2 = IdempotencyKey::new("key2");
-
         reg.check_and_register("tenant1", &key1, "tx1", 0).unwrap();
-        reg.check_and_register("tenant1", &key2, "tx2", 1000)
-            .unwrap();
-
+        reg.check_and_register("tenant1", &key2, "tx2", 1000).unwrap();
         sleep(Duration::from_millis(1));
         reg.purge_expired();
-
         assert_eq!(reg.store.len(), 1);
-        let map_key = ("tenant1".to_string(), "key2".to_string());
-        assert!(reg.store.contains_key(&map_key));
+        assert!(reg.store.contains_key(&("tenant1".to_string(), "key2".to_string())));
     }
 }
