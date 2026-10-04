@@ -4,7 +4,6 @@
 //! Wraps FIPS 203 (ML-KEM-1024) and FIPS 204 (ML-DSA-87).
 
 pub mod avx512;
-
 pub mod vault;
 
 use crate::vault::{EncryptedEnvelope, KeyProtector, VaultError};
@@ -20,7 +19,6 @@ use zeroize::Zeroize;
 
 pub use serde_cbor;
 
-/// Cryptographic errors for core operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("PQC Encapsulation failed")]
@@ -35,22 +33,12 @@ pub enum CryptoError {
     Internal(String),
 }
 
-/// ML-KEM-1024 encapsulation key byte length (1568 bytes).
 pub const ENCAP_KEY_LEN: usize = 1568;
-
-/// ML-KEM-1024 ciphertext byte length (1568 bytes).
 pub const CIPHERTEXT_LEN: usize = 1568;
-
-/// ML-KEM-1024 shared key byte length (32 bytes).
 pub const SHARED_KEY_LEN: usize = 32;
-
-/// ML-DSA-87 public key byte length (2592 bytes).
 pub const DSA_PUB_KEY_LEN: usize = ml_dsa_87::PK_LEN;
-
-/// ML-DSA-87 signature byte length (4627 bytes).
 pub const DSA_SIG_LEN: usize = ml_dsa_87::SIG_LEN;
 
-/// Quantum-safe proxy node cryptographic identity.
 #[derive(Clone)]
 pub struct QuantumNodeIdentity {
     pub secure_dsa_private: Option<crate::secure_memory::SecureKeyMaterial>,
@@ -156,8 +144,9 @@ impl QuantumNodeIdentity {
         vault_path: &Path,
         protector: &P,
     ) -> Result<KeyTransitionRecord, Box<dyn std::error::Error>> {
-        let (new_dsa_pk, new_dsa_sk) = ml_dsa_87::try_keygen().map_err(|e| format!("Failed to generate new ML-DSA-87 keypair: {e}"))?;
-        let new_pk_bytes: Vec<u8> = new_dsa_pk.clone().into_bytes().to_vec();
+        let (new_dsa_pk, new_dsa_sk) = ml_dsa_87::try_keygen()
+            .map_err(|e| format!("Failed to generate new ML-DSA-87 keypair: {e}"))?;
+        let new_pk_bytes = new_dsa_pk.clone().into_bytes().to_vec();
         let transition_payload = KeyTransitionPayload {
             old_pubkey_fingerprint: self.signer_pub_fingerprint(),
             new_pubkey_fingerprint: QuantumNodeIdentity::hash_ledger_block(&new_pk_bytes),
@@ -207,7 +196,8 @@ impl QuantumNodeIdentity {
     }
 
     pub fn dsa_public_key_bytes(&self) -> Vec<u8> {
-        self.dsa_public_key.clone().into_bytes().to_vec()
+        let pk_bytes: [u8; ml_dsa_87::PK_LEN] = self.dsa_public_key.clone().into_bytes();
+        pk_bytes.to_vec()
     }
 
     pub fn encapsulate_shared_secret(
@@ -225,7 +215,9 @@ impl QuantumNodeIdentity {
         decap_key.decapsulate(ciphertext).map_err(|_| CryptoError::DecapsulationFailed)
     }
 
-    pub fn encapsulate_shared_secret_from_bytes(remote_encap_key_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    pub fn encapsulate_shared_secret_from_bytes(
+        remote_encap_key_bytes: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
         if remote_encap_key_bytes.len() != ENCAP_KEY_LEN {
             return Err(CryptoError::InvalidKeyLength { expected: ENCAP_KEY_LEN, actual: remote_encap_key_bytes.len() });
         }
@@ -298,28 +290,31 @@ pub struct StoredIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_quantum_identity_handshake() {
         let node_a = QuantumNodeIdentity::generate_node_identity().unwrap();
         let node_b = QuantumNodeIdentity::generate_node_identity().unwrap();
         let (ciphertext, secret_a) = QuantumNodeIdentity::encapsulate_shared_secret(&node_b.kem_encap_key).unwrap();
         let secret_b = node_b.decapsulate_shared_secret(&ciphertext).unwrap();
-        assert_eq!(secret_a.as_slice(), secret_b.as_slice());
+        assert_eq!(secret_a.as_slice(), secret_b.as_slice(), "ML-KEM-1024 shared secrets must match");
         let ek_bytes = node_b.encap_key_bytes();
         let (ct_bytes, ss_a_bytes) = QuantumNodeIdentity::encapsulate_shared_secret_from_bytes(&ek_bytes).unwrap();
         let ss_b_bytes = node_b.decapsulate_from_bytes(&ct_bytes).unwrap();
-        assert_eq!(ss_a_bytes, ss_b_bytes);
+        assert_eq!(ss_a_bytes, ss_b_bytes, "Byte-level KEM must agree");
         let payload = b"VARDHAN_QUANTUM_PROXY_MANIFEST_001";
         let signature = node_a.sign_payload(payload).unwrap();
         let dsa_pub = node_a.dsa_public_key_bytes();
-        assert!(QuantumNodeIdentity::verify_signature(&dsa_pub, payload, &signature));
+        assert!(QuantumNodeIdentity::verify_signature(&dsa_pub, payload, &signature), "ML-DSA-87 signature must be valid");
         let dsa_pub_b = node_b.dsa_public_key_bytes();
-        assert!(!QuantumNodeIdentity::verify_signature(&dsa_pub_b, payload, &signature));
+        assert!(!QuantumNodeIdentity::verify_signature(&dsa_pub_b, payload, &signature), "Signature verified by wrong key must fail");
         let block_hash = QuantumNodeIdentity::hash_ledger_block(payload);
         assert_ne!(block_hash, [0u8; 32]);
     }
+}
 
+#[cfg(test)]
+mod clone_test {
+    use super::*;
     #[test]
     fn test_clone() {
         let id = QuantumNodeIdentity::generate_node_identity().unwrap();
