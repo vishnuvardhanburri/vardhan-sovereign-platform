@@ -81,6 +81,10 @@ impl ExposureDetector {
         self.current.status()
     }
 
+    pub fn descriptor(&self, signer: &QuantumNodeIdentity) -> Result<EpochDescriptor, ExposureDetectorError> {
+        Ok(self.current.descriptor(signer)?)
+    }
+
     pub fn on_exposure(
         &mut self,
         event: ExposureEvent,
