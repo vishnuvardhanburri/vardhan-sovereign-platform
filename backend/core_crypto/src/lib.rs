@@ -560,3 +560,4 @@ pub mod anti_tamper;
 pub mod enclave;
 pub mod license;
 pub mod secure_memory;
+pub mod aer_kep_q;
